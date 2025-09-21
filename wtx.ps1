@@ -18,9 +18,7 @@ function Get-UserHome {
   return (Join-Path $env:SystemDrive 'Users\Public')
 }
 
-$CONFIG_DIR_DEFAULT = if ($env:APPDATA) { Join-Path $env:APPDATA 'wtx' } else { Join-Path (Get-UserHome) '.wtx' }
-$CONFIG_FILE_DEFAULT = Join-Path $CONFIG_DIR_DEFAULT 'config.kv'
-$CONFIG_FILE = if ($env:WTX_CONFIG_FILE) { $env:WTX_CONFIG_FILE } else { $CONFIG_FILE_DEFAULT }
+# Local-only configuration: values are stored in <repo>/.wtx.kv
 
 $CONFIG_DEFAULTS = @{
   'repo.path'                    = Join-Path (Get-UserHome) 'Developer/your-project'
@@ -34,11 +32,6 @@ $CONFIG_DEFAULTS = @{
   'add.serve-dev.command'        = ''
   'add.serve-dev.logging-path'   = 'tmp'
   'language'                     = 'en'
-}
-
-function Ensure-ConfigDir {
-  $dir = Split-Path -Parent $CONFIG_FILE
-  if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
 }
 
 function Load-Config {
@@ -66,13 +59,6 @@ function Load-Config {
   return $cfg
 }
 
-function Save-Config([hashtable]$cfg) {
-  Ensure-ConfigDir
-  $lines = @()
-  foreach ($k in ($cfg.Keys | Sort-Object)) { $lines += "$k=$($cfg[$k])" }
-  Set-Content -LiteralPath $CONFIG_FILE -Value $lines -Encoding UTF8
-}
-
 # Lightweight KV helpers for config mutations
 function __Read-Kv([string]$path) {
   $m = [ordered]@{}
@@ -97,42 +83,22 @@ function __Write-Kv([string]$path, [hashtable]$map) {
   Set-Content -LiteralPath $path -Value $lines -Encoding UTF8
 }
 
-function Config-Set([string]$key, [string]$value, [string]$scope) {
-  if ($scope -eq 'local') {
-    $root = Repo-Root .
-    if (-not $root) {
-      $g = __Read-Kv $CONFIG_FILE
-      if ($g.Contains('repo.path') -and (Test-Path $g['repo.path'])) { $root = $g['repo.path'] }
-    }
-    if (-not $root) { throw 'wtx: cannot resolve repo root for local config (run inside a repo or set repo.path)' }
-    $p = Join-Path $root '.wtx.kv'
-    $m = __Read-Kv $p
-    $m[$key] = $value
-    __Write-Kv $p $m
-  } else {
-    $m = __Read-Kv $CONFIG_FILE
-    $m[$key] = $value
-    __Write-Kv $CONFIG_FILE $m
-  }
+function Config-Set([string]$key, [string]$value) {
+  $root = Repo-Root .
+  if (-not $root) { throw 'wtx: run inside a git repo or worktree to modify local config' }
+  $p = Join-Path $root '.wtx.kv'
+  $m = __Read-Kv $p
+  $m[$key] = $value
+  __Write-Kv $p $m
 }
 
-function Config-Unset([string]$key, [string]$scope) {
-  if ($scope -eq 'local') {
-    $root = Repo-Root .
-    if (-not $root) {
-      $g = __Read-Kv $CONFIG_FILE
-      if ($g.Contains('repo.path') -and (Test-Path $g['repo.path'])) { $root = $g['repo.path'] }
-    }
-    if (-not $root) { throw 'wtx: cannot resolve repo root for local config (run inside a repo or set repo.path)' }
-    $p = Join-Path $root '.wtx.kv'
-    $m = __Read-Kv $p
-    if ($m.Contains($key)) { $null = $m.Remove($key) }
-    __Write-Kv $p $m
-  } else {
-    $m = __Read-Kv $CONFIG_FILE
-    if ($m.Contains($key)) { $null = $m.Remove($key) }
-    __Write-Kv $CONFIG_FILE $m
-  }
+function Config-Unset([string]$key) {
+  $root = Repo-Root .
+  if (-not $root) { throw 'wtx: run inside a git repo or worktree to modify local config' }
+  $p = Join-Path $root '.wtx.kv'
+  $m = __Read-Kv $p
+  if ($m.Contains($key)) { $null = $m.Remove($key) }
+  __Write-Kv $p $m
 }
 
 function Parse-Bool([string]$val) {
@@ -201,24 +167,80 @@ function Compute-WorktreePath([string]$repoPath, [string]$name) {
   return Join-Path $parent ("$repoDir.$name")
 }
 
+function Get-Worktrees([string]$repoPath) {
+  if (-not $repoPath) { throw 'Get-Worktrees: repoPath is required' }
+  if (-not (Test-Path $repoPath)) { throw "Get-Worktrees: not found: $repoPath" }
+  Require-Git
+  $lines = & git -C $repoPath worktree list --porcelain 2>$null
+  $raw = @()
+  if ($LASTEXITCODE -ne 0 -or -not $lines) {
+    # Fallback: parse non-porcelain output (less reliable)
+    $fallback = & git -C $repoPath worktree list 2>$null
+    foreach ($ln in $fallback) {
+      $p = ($ln -split '\s+')[0]
+      if ($p) { $raw += [pscustomobject]@{ Path = $p; Branch = ''; Head = '' } }
+    }
+  } else {
+    $cur = @{}
+    foreach ($ln in $lines) {
+      $t = $ln.Trim()
+      if (-not $t) { continue }
+      if ($t.StartsWith('worktree ')) {
+        if ($cur.ContainsKey('Path')) { $raw += [pscustomobject]$cur; $cur = @{} }
+        $cur['Path'] = $t.Substring(9).Trim()
+        continue
+      }
+      if ($t.StartsWith('branch ')) {
+        $br = $t.Substring(7).Trim()
+        if ($br -and $br.StartsWith('refs/heads/')) { $br = $br.Substring(11) }
+        $cur['Branch'] = $br
+        continue
+      }
+      if ($t.StartsWith('HEAD ')) { $cur['Head'] = $t.Substring(5).Trim(); continue }
+    }
+    if ($cur.ContainsKey('Path')) { $raw += [pscustomobject]$cur }
+  }
+
+  # Derive Name from path convention: <parent>/<repo>.<name>
+  $repoDir = Split-Path -Leaf $repoPath
+  $parent = Split-Path -Parent $repoPath
+  $prefix = Join-Path $parent ($repoDir + '.')
+  $prefixFwd = $prefix -replace '\\','/'
+  $repoPathFwd = ([IO.Path]::GetFullPath($repoPath)) -replace '\\','/'
+  $results = @()
+  foreach ($it in $raw) {
+    $p = ("" + $it.Path)
+    $pFwd = $p -replace '\\','/'
+    $name = $null
+    if (([IO.Path]::GetFullPath($p) -replace '\\','/').TrimEnd('/') -eq $repoPathFwd.TrimEnd('/')) {
+      $name = ''
+    } elseif ($pFwd.StartsWith($prefixFwd)) {
+      $name = $pFwd.Substring($prefixFwd.Length)
+    } else {
+      $leaf = Split-Path -Leaf $p
+      $prefixLeaf = "$repoDir."
+      if ($leaf.StartsWith($prefixLeaf)) { $name = $leaf.Substring($prefixLeaf.Length) } else { $name = $leaf }
+    }
+    $results += [pscustomobject]@{ Path = $p; Name = $name; Branch = $it.Branch; Head = $it.Head }
+  }
+  return ,$results
+}
+
 function Cmd-Help {
   @'
 Usage: wtx.ps1 <command> [args]
 
 Commands:
   help          Show this help
-  init [--local|--global]
-                Capture repo.path and default branch for current repo;
-                writes to local by default (repo .wtx.kv)
+  init          Capture repo.path and default branch for current repo;
+                writes all defaults to local repo .wtx.kv
   list          List git worktrees
   main          Print configured main repo path
   path <name>   Print absolute path for a worktree name
   add <name>    Create worktree (branch, copy .env*, install deps, start dev)
   rm [name]     Remove current or named worktree and its branch
   clean         Remove numerically named worktrees (feat/<digits>)
-  config list|get|set|unset [--local|--global]
-                             Manage config (list/get shows merged view);
-                             set/unset default to local scope (repo .wtx.kv)
+  config list|get|set|unset  Manage local config (list/get shows merged view)
   shell-hook    Print PowerShell profile snippet with auto-cd
   self-install [-Prefix <dir>]  Copy wtx to install location and add shell hook
 '@ | Write-Host
@@ -233,41 +255,19 @@ function Cmd-Init {
   $repoFull = [IO.Path]::GetFullPath($repoPath)
   if ($repoFull -eq $userHome) { throw 'wtx: refusing to target home directory; choose a project repository' }
 
-  # scope: default local unless --global is provided
-  $scope = 'local'
-  foreach ($a in ($argv | ForEach-Object { $_ })) {
-    if ($a -eq '--global') { $scope = 'global' }
-    if ($a -eq '--local') { $scope = 'local' }
-  }
-
   $branch = Default-Branch $repoPath
-  Config-Set -key 'repo.path' -value $repoPath -scope $scope
-  Config-Set -key 'repo.branch' -value $branch -scope $scope
-  Write-Info "Set repo.path = $repoPath ($scope)"
-  Write-Info "Set repo.branch = $branch ($scope)"
-
-  $writeDefaults = $false
-  foreach ($a in $argv) { if ($a -eq '--write-defaults' -or $a -eq '-w') { $writeDefaults = $true } }
-  if ($writeDefaults) {
-    if ($scope -eq 'local') {
-      $p = Join-Path $repoPath '.wtx.kv'
-      $m = __Read-Kv $p
-      foreach ($k in $CONFIG_DEFAULTS.Keys) {
-        if ($k -in @('repo.path','repo.branch')) { continue }
-        if (-not $m.Contains($k)) { $m[$k] = $CONFIG_DEFAULTS[$k] }
-      }
-      __Write-Kv $p $m
-      Write-Info 'Materialized default keys to .wtx.kv'
-    } else {
-      $m = __Read-Kv $CONFIG_FILE
-      foreach ($k in $CONFIG_DEFAULTS.Keys) {
-        if ($k -in @('repo.path','repo.branch')) { continue }
-        if (-not $m.Contains($k)) { $m[$k] = $CONFIG_DEFAULTS[$k] }
-      }
-      __Write-Kv $CONFIG_FILE $m
-      Write-Info 'Materialized default keys to global config'
-    }
+  $p = Join-Path $repoPath '.wtx.kv'
+  $m = __Read-Kv $p
+  # Always set core keys to current repo/branch
+  $m['repo.path'] = $repoPath
+  $m['repo.branch'] = $branch
+  # Materialize all default keys if missing
+  foreach ($k in $CONFIG_DEFAULTS.Keys) {
+    if (-not $m.Contains($k)) { $m[$k] = $CONFIG_DEFAULTS[$k] }
   }
+  __Write-Kv $p $m
+  Write-Info "Wrote local config: $p"
+  Write-Info "repo.path=$repoPath; repo.branch=$branch"
   Write-Info 'wtx init complete; future commands will use these defaults'
 }
 
@@ -416,6 +416,17 @@ function Cmd-Rm {
   }
 
   Write-Info "Removing worktree: $worktreePath"
+  # If we're currently inside the worktree being removed, change to main repo
+  $pushedFromWorktree = $false
+  try {
+    $curRoot = Repo-Root .
+    if ($curRoot) {
+      $curRootN = ([IO.Path]::GetFullPath($curRoot) -replace '\\','/').TrimEnd('/')
+      $worktreeN = ([IO.Path]::GetFullPath($worktreePath) -replace '\\','/').TrimEnd('/')
+      if ($curRootN -eq $worktreeN) { Push-Location $repoPath; $pushedFromWorktree = $true }
+    }
+  } catch { }
+
   $removed = $false
   try {
     # Try Git removal first; if it prompts or fails, we'll fall back
@@ -429,11 +440,15 @@ function Cmd-Rm {
       try { Get-ChildItem -LiteralPath $worktreePath -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object { try { $_.Attributes = 'Normal' } catch { } } } catch { }
       try { Remove-Item -LiteralPath $worktreePath -Recurse -Force -ErrorAction SilentlyContinue } catch { }
       if (Test-Path $worktreePath) {
-        try { cmd /c rmdir /s /q "$worktreePath" | Out-Null } catch { }
+        # Normalize path separators for cmd.exe rmdir
+        $winPath = $worktreePath -replace '/', "\" 
+        try { cmd /c "rmdir /s /q \"$winPath\"" | Out-Null } catch { }
       }
       try { & git -C $repoPath worktree prune -v | Out-Null } catch { }
     }
   }
+
+  if ($pushedFromWorktree) { try { Pop-Location } catch { } }
   if ($branchName) {
     $exists = (& git -C $repoPath branch --list $branchName).Trim()
     if ($exists) {
@@ -441,7 +456,7 @@ function Cmd-Rm {
       Write-Info "Deleted branch $branchName"
     }
   }
-  Write-Info "Removed worktree $worktreePath"
+  if (-not (Test-Path $worktreePath)) { Write-Info "Removed worktree $worktreePath" } else { Write-Warn "Worktree still present: $worktreePath" }
 }
 
 function Cmd-Clean {
@@ -491,29 +506,40 @@ function $Name {
   }
   if (`$Args[0] -eq 'rm') {
     `$prevRoot = (git rev-parse --show-toplevel 2>`$null)
+    # Resolve main repo path before making changes (worktree may disappear)
+    `$prevMain = (& pwsh -NoLogo -NoProfile -File '$escaped' main | Select-Object -Last 1)
     `$nameArg = `$null
     if (`$Args.Count -ge 2) { foreach (`$a in `$Args[1..(`$Args.Count-1)]) { if (`$a -notlike '--*' -and -not `$nameArg) { `$nameArg = `$a } } }
     `$targetPath = `$null
     if (`$nameArg) { `$targetPath = (& pwsh -NoLogo -NoProfile -File '$escaped' path `$nameArg | Select-Object -Last 1) }
     & pwsh -NoLogo -NoProfile -File '$escaped' @Args | Out-Host
-    if (-not `$nameArg -or (`$targetPath -and `$prevRoot -and (`$prevRoot -eq `$targetPath))) {
-      `$main = (& pwsh -NoLogo -NoProfile -File '$escaped' main | Select-Object -Last 1)
-      if (`$LASTEXITCODE -eq 0 -and `$main) { Set-Location `$main }
+    `$shouldCdMain = `$false
+    if (-not `$nameArg) { `$shouldCdMain = `$true }
+    elseif (`$targetPath -and `$prevRoot -and (`$prevRoot -eq `$targetPath)) { `$shouldCdMain = `$true }
+    elseif (`$prevRoot -and -not (Test-Path `$prevRoot)) { `$shouldCdMain = `$true }
+    if (`$shouldCdMain) { if (`$prevMain) { Set-Location `$prevMain } }
+    return
+  }
+  if (`$Args[0] -eq 'clean') {
+    `$prevRoot = (git rev-parse --show-toplevel 2>`$null)
+    # Resolve main repo path before cleaning, in case current dir is removed during operation
+    `$prevMain = (& pwsh -NoLogo -NoProfile -File '$escaped' main | Select-Object -Last 1)
+    # If current is a numeric worktree, preemptively move to main so removal isn't blocked by the shell's CWD lock
+    if (`$prevRoot -and `$prevMain) {
+      try {
+        `$leaf = [IO.Path]::GetFileName(`$prevRoot)
+        if (`$leaf -and (`$leaf -match '\.[0-9]+$')) { Set-Location `$prevMain }
+      } catch { }
+    }
+    & pwsh -NoLogo -NoProfile -File '$escaped' @Args | Out-Host
+    if (`$prevRoot -and -not (Test-Path `$prevRoot)) {
+      if (`$prevMain) { Set-Location `$prevMain }
     }
     return
   }
   if (`$Args.Count -eq 1) {
     `$p = (& pwsh -NoLogo -NoProfile -File '$escaped' path `$Args[0] | Select-Object -Last 1)
     if (`$LASTEXITCODE -eq 0 -and `$p) { Set-Location `$p }
-    return
-  }
-  if (`$Args[0] -eq 'clean') {
-    `$prevRoot = (git rev-parse --show-toplevel 2>`$null)
-    & pwsh -NoLogo -NoProfile -File '$escaped' @Args | Out-Host
-    if (`$prevRoot -and -not (Test-Path `$prevRoot)) {
-      `$main = (& pwsh -NoLogo -NoProfile -File '$escaped' main | Select-Object -Last 1)
-      if (`$LASTEXITCODE -eq 0 -and `$main) { Set-Location `$main }
-    }
     return
   }
   & pwsh -NoLogo -NoProfile -File '$escaped' @Args | Out-Host
@@ -527,20 +553,14 @@ function Cmd-Config {
   param([string[]]$argv)
   if (-not $argv -or $argv.Count -lt 1) { throw 'config requires an action' }
   $action = $argv[0]
-  $scope = 'local'
   $rest = @()
-  for ($i=1; $i -lt $argv.Count; $i++) {
-    $a = $argv[$i]
-    if ($a -eq '--local') { $scope = 'local'; continue }
-    if ($a -eq '--global') { $scope = 'global'; continue }
-    $rest += $a
-  }
+  for ($i=1; $i -lt $argv.Count; $i++) { $rest += $argv[$i] }
   $cfg = Load-Config
   switch ($action) {
     'list' { foreach ($k in ($cfg.Keys | Sort-Object)) { Write-Host "$k=$($cfg[$k])" } }
     'get'  { if ($rest.Count -lt 1) { throw 'config get requires a key' }; $key=$rest[0]; if (-not $cfg.Contains($key)) { throw "config key not found: $key" }; Write-Host $cfg[$key] }
-    'set'  { if ($rest.Count -lt 2) { throw 'config set requires <key> <value>' }; if (-not $PSBoundParameters.ContainsKey('argv')) { } ; Config-Set -key $rest[0] -value $rest[1] -scope $scope }
-    'unset'{ if ($rest.Count -lt 1) { throw 'config unset requires a key' }; Config-Unset -key $rest[0] -scope $scope }
+    'set'  { if ($rest.Count -lt 2) { throw 'config set requires <key> <value>' }; Config-Set -key $rest[0] -value $rest[1] }
+    'unset'{ if ($rest.Count -lt 1) { throw 'config unset requires a key' }; Config-Unset -key $rest[0] }
     default { throw "unknown config action: $action" }
   }
 }
