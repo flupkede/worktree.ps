@@ -353,11 +353,20 @@ function Cmd-Add([string]$name) {
     $files = Parse-StringArray $cfg['add.copy-env.files']
     foreach ($f in $files) {
       $src = Join-Path $repoPath $f
-      $matchingFiles = @(Get-ChildItem -Path $src -ErrorAction SilentlyContinue)
+      $matchingFiles = @(Get-ChildItem -Path $src -Recurse -ErrorAction SilentlyContinue)
       foreach ($file in $matchingFiles) {
-        $dest = Join-Path $worktreePath $file.Name
+        # Calculate relative path from repo root to preserve directory structure
+        $relativePath = $file.FullName.Substring($repoPath.Length + 1)
+        $dest = Join-Path $worktreePath $relativePath
+
+        # Ensure destination directory exists
+        $destDir = Split-Path $dest -Parent
+        if ($destDir -and !(Test-Path $destDir)) {
+          New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+        }
+
         Copy-Item -LiteralPath $file.FullName -Destination $dest -Force
-        Write-Info ("Copy $($file.Name)")
+        Write-Info ("Copy $relativePath")
       }
     }
   }
