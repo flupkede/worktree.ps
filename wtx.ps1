@@ -323,16 +323,41 @@ function Cmd-Add([string]$name) {
   $baseBranch = $cfg['repo.branch']; if (-not $baseBranch) { $baseBranch = Default-Branch $repoPath }
 
   Write-Info "Creating worktree: $worktreePath (branch $branchName)"
-  & git -C $repoPath worktree add -b $branchName $worktreePath $baseBranch | Out-Host
+   
+  # Check if branch already exists (try with prefix first, then without prefix)
+  $existingBranch = & git -C $repoPath branch --list $branchName
+  $existingBranch = if ($existingBranch) { $existingBranch.Trim() } else { $null }
+
+  if (!$existingBranch) {
+    # Try without prefix (just the name)
+    $branchWithoutPrefix = & git -C $repoPath branch --list $name
+    $branchWithoutPrefix = if ($branchWithoutPrefix) { $branchWithoutPrefix.Trim() } else { $null }
+
+    if ($branchWithoutPrefix) {
+      $existingBranch = $name
+      $branchName = $name  # Use the branch without prefix
+    }
+  }
+
+  if ($existingBranch) {
+    # Branch exists: create worktree from existing branch
+    Write-Info "Using existing branch: $branchName"
+    & git -C $repoPath worktree add $worktreePath $branchName | Out-Host
+  } else {
+    # Branch doesn't exist: create new branch from base
+    & git -C $repoPath worktree add -b $branchName $worktreePath $baseBranch | Out-Host
+  }
   Write-Info 'Worktree created'
 
   if (Parse-Bool $cfg['add.copy-env.enabled']) {
     $files = Parse-StringArray $cfg['add.copy-env.files']
     foreach ($f in $files) {
       $src = Join-Path $repoPath $f
-      if (Test-Path $src) {
-        Copy-Item -LiteralPath $src -Destination (Join-Path $worktreePath (Split-Path -Leaf $src)) -Force
-        Write-Info ("Copy $f")
+      $matchingFiles = @(Get-ChildItem -Path $src -ErrorAction SilentlyContinue)
+      foreach ($file in $matchingFiles) {
+        $dest = Join-Path $worktreePath $file.Name
+        Copy-Item -LiteralPath $file.FullName -Destination $dest -Force
+        Write-Info ("Copy $($file.Name)")
       }
     }
   }
